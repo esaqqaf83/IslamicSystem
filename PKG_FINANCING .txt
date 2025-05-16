@@ -1,0 +1,2209 @@
+CREATE OR REPLACE PACKAGE BODY PKG_FINANCING AS
+    /*
+    * تنفيذ حزمة إدارة التمويل
+    */
+    
+    -- إنشاء عقد تمويل جديد
+    PROCEDURE CREATE_FINANCING_CONTRACT(
+        p_customer_id IN NUMBER,
+        p_product_id IN NUMBER,
+        p_financing_amount IN NUMBER,
+        p_profit_rate IN NUMBER,
+        p_installment_count IN NUMBER,
+        p_start_date IN DATE,
+        p_collateral_ids IN VARCHAR2 DEFAULT NULL, -- قائمة معرفات الضمانات مفصولة بفواصل
+        p_notes IN VARCHAR2 DEFAULT NULL,
+        p_created_by IN NUMBER,
+        p_financing_id OUT NUMBER
+    ) IS
+        v_customer_exists NUMBER;
+        v_product_exists NUMBER;
+        v_product_min_amount NUMBER;
+        v_product_max_amount NUMBER;
+        v_product_min_term NUMBER;
+        v_product_max_term NUMBER;
+        v_product_profit_rate NUMBER;
+        v_customer_credit_score NUMBER;
+        v_customer_credit_rating VARCHAR2(50);
+        v_dti_ratio NUMBER;
+        v_profit_amount NUMBER;
+        v_total_amount NUMBER;
+        v_installment_amount NUMBER;
+        v_end_date DATE;
+        v_collateral_id NUMBER;
+        v_collateral_cursor SYS_REFCURSOR;
+        v_collateral_value NUMBER := 0;
+        v_required_collateral_value NUMBER;
+        v_collateral_ids_table DBMS_SQL.VARCHAR2_TABLE;
+        v_collateral_count NUMBER := 0;
+    BEGIN
+        -- التحقق من وجود العميل
+        SELECT COUNT(*) INTO v_customer_exists
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        IF v_customer_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20002, 'العميل غير موجود برقم: ' || p_customer_id);
+        END IF;
+        
+        -- التحقق من وجود المنتج
+        SELECT COUNT(*) INTO v_product_exists
+        FROM ISLAMIC_PRODUCTS
+        WHERE PRODUCT_ID = p_product_id AND PRODUCT_STATUS = 'ACTIVE';
+        
+        IF v_product_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20008, 'المنتج غير موجود أو غير نشط برقم: ' || p_product_id);
+        END IF;
+        
+        -- الحصول على معلومات المنتج
+        SELECT 
+            MIN_FINANCING_AMOUNT,
+            MAX_FINANCING_AMOUNT,
+            MIN_TERM_MONTHS,
+            MAX_TERM_MONTHS,
+            BASE_PROFIT_RATE
+        INTO 
+            v_product_min_amount,
+            v_product_max_amount,
+            v_product_min_term,
+            v_product_max_term,
+            v_product_profit_rate
+        FROM 
+            ISLAMIC_PRODUCTS
+        WHERE 
+            PRODUCT_ID = p_product_id;
+        
+        -- التحقق من مبلغ التمويل ضمن الحدود المسموحة
+        IF p_financing_amount < v_product_min_amount OR p_financing_amount > v_product_max_amount THEN
+            RAISE_APPLICATION_ERROR(-20009, 'مبلغ التمويل خارج النطاق المسموح به للمنتج. الحد الأدنى: ' || 
+                                           v_product_min_amount || ' الحد الأقصى: ' || v_product_max_amount);
+        END IF;
+        
+        -- التحقق من عدد الأقساط ضمن الحدود المسموحة
+        IF p_installment_count < v_product_min_term OR p_installment_count > v_product_max_term THEN
+            RAISE_APPLICATION_ERROR(-20010, 'عدد الأقساط خارج النطاق المسموح به للمنتج. الحد الأدنى: ' || 
+                                           v_product_min_term || ' الحد الأقصى: ' || v_product_max_term);
+        END IF;
+        
+        -- الحصول على التصنيف الائتماني للعميل
+        BEGIN
+            SELECT CREDIT_SCORE, CREDIT_RATING
+            INTO v_customer_credit_score, v_customer_credit_rating
+            FROM CUSTOMER_CREDIT_RATINGS
+            WHERE CUSTOMER_ID = p_customer_id;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                -- إذا لم يكن للعميل تصنيف ائتماني، قم بإنشاء واحد
+                PKG_CREDIT_RATING.UPDATE_CUSTOMER_RATING(p_customer_id);
+                
+                SELECT CREDIT_SCORE, CREDIT_RATING
+                INTO v_customer_credit_score, v_customer_credit_rating
+                FROM CUSTOMER_CREDIT_RATINGS
+                WHERE CUSTOMER_ID = p_customer_id;
+        END;
+        
+        -- التحقق من أهلية العميل للتمويل بناءً على التصنيف الائتماني
+        IF v_customer_credit_rating IN ('F', 'VERY_POOR') THEN
+            RAISE_APPLICATION_ERROR(-20011, 'العميل غير مؤهل للتمويل بسبب التصنيف الائتماني المنخفض');
+        END IF;
+        
+        -- حساب نسبة الالتزامات إلى الدخل
+        v_dti_ratio := PKG_CUSTOMERS.CALCULATE_DTI_RATIO(p_customer_id);
+        
+        -- التحقق من نسبة الالتزامات إلى الدخل
+        IF v_dti_ratio > 50 THEN
+            RAISE_APPLICATION_ERROR(-20012, 'نسبة الالتزامات إلى الدخل مرتفعة جداً: ' || v_dti_ratio || '%');
+        END IF;
+        
+        -- تعديل معدل الربح بناءً على التصنيف الائتماني للعميل
+        CASE v_customer_credit_rating
+            WHEN 'A' THEN v_product_profit_rate := v_product_profit_rate - 0.5;
+            WHEN 'B' THEN v_product_profit_rate := v_product_profit_rate - 0.25;
+            WHEN 'C' THEN v_product_profit_rate := v_product_profit_rate;
+            WHEN 'D' THEN v_product_profit_rate := v_product_profit_rate + 0.5;
+            WHEN 'E' THEN v_product_profit_rate := v_product_profit_rate + 1;
+            ELSE v_product_profit_rate := v_product_profit_rate;
+        END CASE;
+        
+        -- استخدام معدل الربح المقدم إذا كان محدداً
+        IF p_profit_rate IS NOT NULL THEN
+            v_product_profit_rate := p_profit_rate;
+        END IF;
+        
+        -- حساب مبلغ الربح والمبلغ الإجمالي
+        v_profit_amount := ROUND(p_financing_amount * (v_product_profit_rate / 100) * (p_installment_count / 12), 2);
+        v_total_amount := p_financing_amount + v_profit_amount;
+        
+        -- حساب مبلغ القسط الشهري
+        v_installment_amount := ROUND(v_total_amount / p_installment_count, 2);
+        
+        -- حساب تاريخ انتهاء العقد
+        v_end_date := ADD_MONTHS(p_start_date, p_installment_count);
+        
+        -- إنشاء معرف جديد لعقد التمويل
+        SELECT SEQ_FINANCING_ID.NEXTVAL INTO p_financing_id FROM DUAL;
+        
+        -- إدراج عقد التمويل
+        INSERT INTO FINANCING_CONTRACTS (
+            FINANCING_ID, CUSTOMER_ID, PRODUCT_ID, FINANCING_AMOUNT,
+            PROFIT_RATE, PROFIT_AMOUNT, TOTAL_AMOUNT, REMAINING_AMOUNT,
+            INSTALLMENT_COUNT, INSTALLMENT_AMOUNT, START_DATE, END_DATE,
+            CONTRACT_STATUS, NOTES, CREATED_BY, CREATION_DATE
+        ) VALUES (
+            p_financing_id, p_customer_id, p_product_id, p_financing_amount,
+            v_product_profit_rate, v_profit_amount, v_total_amount, v_total_amount,
+            p_installment_count, v_installment_amount, p_start_date, v_end_date,
+            'PENDING_APPROVAL', p_notes, p_created_by, SYSDATE
+        );
+        
+        -- إضافة الضمانات إذا تم تقديمها
+        IF p_collateral_ids IS NOT NULL AND LENGTH(TRIM(p_collateral_ids)) > 0 THEN
+            -- تقسيم سلسلة معرفات الضمانات إلى جدول
+            v_collateral_count := 0;
+            FOR i IN (
+                SELECT REGEXP_SUBSTR(p_collateral_ids, '[^,]+', 1, LEVEL) AS collateral_id
+                FROM DUAL
+                CONNECT BY REGEXP_SUBSTR(p_collateral_ids, '[^,]+', 1, LEVEL) IS NOT NULL
+            ) LOOP
+                v_collateral_count := v_collateral_count + 1;
+                v_collateral_id := TO_NUMBER(TRIM(i.collateral_id));
+                
+                -- إضافة الضمان لعقد التمويل
+                INSERT INTO FINANCING_COLLATERALS (
+                    FINANCING_ID, COLLATERAL_ID, ADDED_DATE, ADDED_BY
+                ) VALUES (
+                    p_financing_id, v_collateral_id, SYSDATE, p_created_by
+                );
+                
+                -- حساب إجمالي قيمة الضمانات
+                SELECT v_collateral_value + COLLATERAL_VALUE INTO v_collateral_value
+                FROM COLLATERALS
+                WHERE COLLATERAL_ID = v_collateral_id;
+            END LOOP;
+        END IF;
+        
+        -- التحقق من كفاية قيمة الضمانات
+        v_required_collateral_value := p_financing_amount * 1.2; -- 120% من مبلغ التمويل
+        
+        IF v_collateral_value < v_required_collateral_value THEN
+            -- إضافة ملاحظة حول عدم كفاية الضمانات
+            INSERT INTO FINANCING_NOTES (
+                NOTE_ID, FINANCING_ID, NOTE_TEXT, CREATED_BY, CREATION_DATE
+            ) VALUES (
+                SEQ_NOTE_ID.NEXTVAL, p_financing_id, 
+                'تنبيه: قيمة الضمانات (' || v_collateral_value || ') أقل من القيمة المطلوبة (' || v_required_collateral_value || ')',
+                p_created_by, SYSDATE
+            );
+        END IF;
+        
+        -- إنشاء جدول الأقساط
+        GENERATE_INSTALLMENT_SCHEDULE(p_financing_id);
+        
+        -- إضافة سجل لتغيير الحالة
+        INSERT INTO FINANCING_STATUS_HISTORY (
+            HISTORY_ID, FINANCING_ID, OLD_STATUS, NEW_STATUS,
+            CHANGE_REASON, CHANGE_DATE, CHANGED_BY
+        ) VALUES (
+            SEQ_STATUS_HISTORY_ID.NEXTVAL, p_financing_id, NULL, 'PENDING_APPROVAL',
+            'إنشاء عقد تمويل جديد', SYSDATE, p_created_by
+        );
+        
+        -- إرسال إشعار للموافقة على التمويل
+        PKG_NOTIFICATIONS.SEND_SYSTEM_NOTIFICATION(
+            p_title => 'طلب تمويل جديد بانتظار الموافقة',
+            p_message => 'تم إنشاء طلب تمويل جديد برقم ' || p_financing_id || ' للعميل رقم ' || p_customer_id || ' بمبلغ ' || p_financing_amount,
+            p_notification_type => 'FINANCING',
+            p_related_id => p_financing_id,
+            p_user_id => NULL -- إرسال لجميع المستخدمين المصرح لهم
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END CREATE_FINANCING_CONTRACT;
+    
+    -- تحديث عقد التمويل
+    PROCEDURE UPDATE_FINANCING_CONTRACT(
+        p_financing_id IN NUMBER,
+        p_profit_rate IN NUMBER DEFAULT NULL,
+        p_installment_count IN NUMBER DEFAULT NULL,
+        p_start_date IN DATE DEFAULT NULL,
+        p_notes IN VARCHAR2 DEFAULT NULL,
+        p_updated_by IN NUMBER
+    ) IS
+        v_contract_status VARCHAR2(50);
+        v_old_profit_rate NUMBER;
+        v_old_installment_count NUMBER;
+        v_old_start_date DATE;
+        v_financing_amount NUMBER;
+        v_profit_amount NUMBER;
+        v_total_amount NUMBER;
+        v_installment_amount NUMBER;
+        v_end_date DATE;
+        v_regenerate_schedule BOOLEAN := FALSE;
+    BEGIN
+        -- الحصول على معلومات العقد الحالية
+        SELECT 
+            CONTRACT_STATUS, PROFIT_RATE, INSTALLMENT_COUNT, 
+            START_DATE, FINANCING_AMOUNT
+        INTO 
+            v_contract_status, v_old_profit_rate, v_old_installment_count, 
+            v_old_start_date, v_financing_amount
+        FROM 
+            FINANCING_CONTRACTS
+        WHERE 
+            FINANCING_ID = p_financing_id;
+        
+        -- التحقق من إمكانية تحديث العقد
+        IF v_contract_status NOT IN ('PENDING_APPROVAL', 'APPROVED', 'ACTIVE') THEN
+            RAISE_APPLICATION_ERROR(-20013, 'لا يمكن تحديث عقد التمويل في الحالة الحالية: ' || v_contract_status);
+        END IF;
+        
+        -- تحديد ما إذا كان يجب إعادة إنشاء جدول الأقساط
+        IF (p_profit_rate IS NOT NULL AND p_profit_rate != v_old_profit_rate) OR
+           (p_installment_count IS NOT NULL AND p_installment_count != v_old_installment_count) OR
+           (p_start_date IS NOT NULL AND p_start_date != v_old_start_date) THEN
+            v_regenerate_schedule := TRUE;
+            
+            -- حساب القيم الجديدة
+            v_profit_amount := ROUND(v_financing_amount * (COALESCE(p_profit_rate, v_old_profit_rate) / 100) * 
+                                    (COALESCE(p_installment_count, v_old_installment_count) / 12), 2);
+            v_total_amount := v_financing_amount + v_profit_amount;
+            v_installment_amount := ROUND(v_total_amount / COALESCE(p_installment_count, v_old_installment_count), 2);
+            v_end_date := ADD_MONTHS(COALESCE(p_start_date, v_old_start_date), COALESCE(p_installment_count, v_old_installment_count));
+        END IF;
+        
+        -- تحديث عقد التمويل
+        UPDATE FINANCING_CONTRACTS
+        SET
+            PROFIT_RATE = COALESCE(p_profit_rate, PROFIT_RATE),
+            INSTALLMENT_COUNT = COALESCE(p_installment_count, INSTALLMENT_COUNT),
+            START_DATE = COALESCE(p_start_date, START_DATE),
+            END_DATE = CASE WHEN v_regenerate_schedule THEN v_end_date ELSE END_DATE END,
+            PROFIT_AMOUNT = CASE WHEN v_regenerate_schedule THEN v_profit_amount ELSE PROFIT_AMOUNT END,
+            TOTAL_AMOUNT = CASE WHEN v_regenerate_schedule THEN v_total_amount ELSE TOTAL_AMOUNT END,
+            REMAINING_AMOUNT = CASE WHEN v_regenerate_schedule THEN v_total_amount ELSE REMAINING_AMOUNT END,
+            INSTALLMENT_AMOUNT = CASE WHEN v_regenerate_schedule THEN v_installment_amount ELSE INSTALLMENT_AMOUNT END,
+            NOTES = CASE WHEN p_notes IS NOT NULL THEN p_notes ELSE NOTES END,
+            LAST_UPDATE_DATE = SYSDATE,
+            LAST_UPDATED_BY = p_updated_by
+        WHERE 
+            FINANCING_ID = p_financing_id;
+        
+        -- إعادة إنشاء جدول الأقساط إذا لزم الأمر
+        IF v_regenerate_schedule THEN
+            GENERATE_INSTALLMENT_SCHEDULE(p_financing_id, TRUE);
+        END IF;
+        
+        -- إضافة ملاحظة حول التحديث
+        INSERT INTO FINANCING_NOTES (
+            NOTE_ID, FINANCING_ID, NOTE_TEXT, CREATED_BY, CREATION_DATE
+        ) VALUES (
+            SEQ_NOTE_ID.NEXTVAL, p_financing_id, 
+            'تم تحديث عقد التمويل بواسطة المستخدم رقم ' || p_updated_by,
+            p_updated_by, SYSDATE
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END UPDATE_FINANCING_CONTRACT;
+    
+    -- الحصول على تفاصيل عقد التمويل
+    FUNCTION GET_FINANCING_CONTRACT(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*) INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                fc.FINANCING_ID,
+                fc.CUSTOMER_ID,
+                c.FULL_NAME AS CUSTOMER_NAME,
+                c.NATIONAL_ID AS CUSTOMER_NATIONAL_ID,
+                c.MOBILE AS CUSTOMER_MOBILE,
+                fc.PRODUCT_ID,
+                ip.PRODUCT_NAME,
+                ip.PRODUCT_TYPE,
+                fc.FINANCING_AMOUNT,
+                fc.PROFIT_RATE,
+                fc.PROFIT_AMOUNT,
+                fc.TOTAL_AMOUNT,
+                fc.REMAINING_AMOUNT,
+                fc.INSTALLMENT_COUNT,
+                fc.INSTALLMENT_AMOUNT,
+                fc.START_DATE,
+                fc.END_DATE,
+                fc.CONTRACT_STATUS,
+                fc.NOTES,
+                fc.CREATED_BY,
+                u1.USERNAME AS CREATED_BY_NAME,
+                fc.CREATION_DATE,
+                fc.LAST_UPDATED_BY,
+                u2.USERNAME AS UPDATED_BY_NAME,
+                fc.LAST_UPDATE_DATE,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID) AS TOTAL_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'PAID') AS PAID_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'OVERDUE') AS OVERDUE_INSTALLMENTS,
+                (SELECT COUNT(*) FROM FINANCING_COLLATERALS fcol WHERE fcol.FINANCING_ID = fc.FINANCING_ID) AS COLLATERAL_COUNT,
+                (SELECT SUM(col.COLLATERAL_VALUE) FROM FINANCING_COLLATERALS fcol JOIN COLLATERALS col ON fcol.COLLATERAL_ID = col.COLLATERAL_ID WHERE fcol.FINANCING_ID = fc.FINANCING_ID) AS TOTAL_COLLATERAL_VALUE,
+                (SELECT MIN(ins.DUE_DATE) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'UNPAID') AS NEXT_INSTALLMENT_DATE,
+                (SELECT ins.INSTALLMENT_AMOUNT FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'UNPAID' AND ROWNUM = 1) AS NEXT_INSTALLMENT_AMOUNT
+            FROM 
+                FINANCING_CONTRACTS fc
+                JOIN CUSTOMERS c ON fc.CUSTOMER_ID = c.CUSTOMER_ID
+                JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+                LEFT JOIN USERS u1 ON fc.CREATED_BY = u1.USER_ID
+                LEFT JOIN USERS u2 ON fc.LAST_UPDATED_BY = u2.USER_ID
+            WHERE 
+                fc.FINANCING_ID = p_financing_id;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_FINANCING_CONTRACT;
+    
+    -- الحصول على جدول الأقساط لعقد التمويل
+    FUNCTION GET_INSTALLMENT_SCHEDULE(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*) INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                ins.INSTALLMENT_ID,
+                ins.FINANCING_ID,
+                ins.INSTALLMENT_NUMBER,
+                ins.INSTALLMENT_AMOUNT,
+                ins.PRINCIPAL_AMOUNT,
+                ins.PROFIT_AMOUNT,
+                ins.DUE_DATE,
+                ins.INSTALLMENT_STATUS,
+                ins.PAID_DATE,
+                ins.PAID_AMOUNT,
+                ins.REMAINING_AMOUNT,
+                ins.LATE_FEES,
+                ins.CREATION_DATE,
+                ins.LAST_UPDATE_DATE,
+                p.PAYMENT_ID,
+                p.PAYMENT_METHOD,
+                p.REFERENCE_NUMBER,
+                CASE 
+                    WHEN ins.INSTALLMENT_STATUS = 'PAID' AND ins.PAID_DATE > ins.DUE_DATE THEN 'متأخر'
+                    WHEN ins.INSTALLMENT_STATUS = 'PAID' AND ins.PAID_DATE <= ins.DUE_DATE THEN 'في الموعد'
+                    WHEN ins.INSTALLMENT_STATUS = 'UNPAID' AND SYSDATE > ins.DUE_DATE THEN 'متأخر'
+                    WHEN ins.INSTALLMENT_STATUS = 'UNPAID' AND SYSDATE <= ins.DUE_DATE THEN 'مستقبلي'
+                    ELSE ins.INSTALLMENT_STATUS
+                END AS PAYMENT_STATUS,
+                CASE 
+                    WHEN ins.INSTALLMENT_STATUS = 'PAID' AND ins.PAID_DATE > ins.DUE_DATE THEN TRUNC(ins.PAID_DATE) - TRUNC(ins.DUE_DATE)
+                    WHEN ins.INSTALLMENT_STATUS = 'UNPAID' AND SYSDATE > ins.DUE_DATE THEN TRUNC(SYSDATE) - TRUNC(ins.DUE_DATE)
+                    ELSE 0
+                END AS DAYS_LATE
+            FROM 
+                INSTALLMENT_SCHEDULE ins
+                LEFT JOIN PAYMENTS p ON ins.INSTALLMENT_ID = p.INSTALLMENT_ID
+            WHERE 
+                ins.FINANCING_ID = p_financing_id
+            ORDER BY 
+                ins.INSTALLMENT_NUMBER;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_INSTALLMENT_SCHEDULE;
+    
+    -- تغيير حالة عقد التمويل
+    PROCEDURE CHANGE_CONTRACT_STATUS(
+        p_financing_id IN NUMBER,
+        p_new_status IN VARCHAR2,
+        p_reason IN VARCHAR2,
+        p_updated_by IN NUMBER
+    ) IS
+        v_old_status VARCHAR2(50);
+        v_customer_id NUMBER;
+        v_financing_amount NUMBER;
+        v_product_name VARCHAR2(100);
+    BEGIN
+        -- الحصول على الحالة الحالية للعقد ومعلومات أخرى
+        SELECT 
+            fc.CONTRACT_STATUS, fc.CUSTOMER_ID, fc.FINANCING_AMOUNT, ip.PRODUCT_NAME
+        INTO 
+            v_old_status, v_customer_id, v_financing_amount, v_product_name
+        FROM 
+            FINANCING_CONTRACTS fc
+            JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+        WHERE 
+            fc.FINANCING_ID = p_financing_id;
+        
+        -- التحقق من صحة تغيير الحالة
+        IF v_old_status = p_new_status THEN
+            RETURN; -- لا يوجد تغيير في الحالة
+        END IF;
+        
+        -- التحقق من صحة الانتقال بين الحالات
+        CASE p_new_status
+            WHEN 'APPROVED' THEN
+                IF v_old_status != 'PENDING_APPROVAL' THEN
+                    RAISE_APPLICATION_ERROR(-20015, 'لا يمكن تغيير الحالة من ' || v_old_status || ' إلى APPROVED');
+                END IF;
+            WHEN 'REJECTED' THEN
+                IF v_old_status != 'PENDING_APPROVAL' THEN
+                    RAISE_APPLICATION_ERROR(-20016, 'لا يمكن تغيير الحالة من ' || v_old_status || ' إلى REJECTED');
+                END IF;
+            WHEN 'ACTIVE' THEN
+                IF v_old_status != 'APPROVED' THEN
+                    RAISE_APPLICATION_ERROR(-20017, 'لا يمكن تغيير الحالة من ' || v_old_status || ' إلى ACTIVE');
+                END IF;
+            WHEN 'COMPLETED' THEN
+                IF v_old_status != 'ACTIVE' THEN
+                    RAISE_APPLICATION_ERROR(-20018, 'لا يمكن تغيير الحالة من ' || v_old_status || ' إلى COMPLETED');
+                END IF;
+            WHEN 'CANCELLED' THEN
+                IF v_old_status NOT IN ('PENDING_APPROVAL', 'APPROVED') THEN
+                    RAISE_APPLICATION_ERROR(-20019, 'لا يمكن تغيير الحالة من ' || v_old_status || ' إلى CANCELLED');
+                END IF;
+            WHEN 'DEFAULTED' THEN
+                IF v_old_status != 'ACTIVE' THEN
+                    RAISE_APPLICATION_ERROR(-20020, 'لا يمكن تغيير الحالة من ' || v_old_status || ' إلى DEFAULTED');
+                END IF;
+            WHEN 'SETTLED' THEN
+                IF v_old_status != 'ACTIVE' THEN
+                    RAISE_APPLICATION_ERROR(-20021, 'لا يمكن تغيير الحالة من ' || v_old_status || ' إلى SETTLED');
+                END IF;
+            ELSE
+                RAISE_APPLICATION_ERROR(-20022, 'حالة غير صالحة: ' || p_new_status);
+        END CASE;
+        
+        -- تحديث حالة العقد
+        UPDATE FINANCING_CONTRACTS
+        SET
+            CONTRACT_STATUS = p_new_status,
+            LAST_UPDATE_DATE = SYSDATE,
+            LAST_UPDATED_BY = p_updated_by
+        WHERE 
+            FINANCING_ID = p_financing_id;
+        
+        -- إضافة سجل لتغيير الحالة
+        INSERT INTO FINANCING_STATUS_HISTORY (
+            HISTORY_ID, FINANCING_ID, OLD_STATUS, NEW_STATUS,
+            CHANGE_REASON, CHANGE_DATE, CHANGED_BY
+        ) VALUES (
+            SEQ_STATUS_HISTORY_ID.NEXTVAL, p_financing_id, v_old_status, p_new_status,
+            p_reason, SYSDATE, p_updated_by
+        );
+        
+        -- إجراءات إضافية بناءً على الحالة الجديدة
+        CASE p_new_status
+            WHEN 'APPROVED' THEN
+                -- إرسال إشعار للعميل
+                PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+                    p_customer_id => v_customer_id,
+                    p_title => 'تمت الموافقة على طلب التمويل',
+                    p_message => 'تمت الموافقة على طلب التمويل الخاص بك رقم ' || p_financing_id || ' بمبلغ ' || v_financing_amount || ' للمنتج ' || v_product_name,
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id
+                );
+                
+            WHEN 'REJECTED' THEN
+                -- إرسال إشعار للعميل
+                PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+                    p_customer_id => v_customer_id,
+                    p_title => 'تم رفض طلب التمويل',
+                    p_message => 'نأسف لإبلاغك بأنه تم رفض طلب التمويل الخاص بك رقم ' || p_financing_id || ' للمنتج ' || v_product_name || '. السبب: ' || p_reason,
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id
+                );
+                
+            WHEN 'ACTIVE' THEN
+                -- تحديث التزامات العميل المالية
+                INSERT INTO CUSTOMER_FINANCIAL_OBLIGATIONS (
+                    OBLIGATION_ID, CUSTOMER_ID, OBLIGATION_TYPE, OBLIGATION_AMOUNT,
+                    MONTHLY_PAYMENT, START_DATE, END_DATE, DESCRIPTION, CREATION_DATE
+                ) VALUES (
+                    SEQ_OBLIGATION_ID.NEXTVAL, v_customer_id, 'FINANCING', v_financing_amount,
+                    (SELECT INSTALLMENT_AMOUNT FROM FINANCING_CONTRACTS WHERE FINANCING_ID = p_financing_id),
+                    SYSDATE, (SELECT END_DATE FROM FINANCING_CONTRACTS WHERE FINANCING_ID = p_financing_id),
+                    'تمويل رقم ' || p_financing_id || ' - ' || v_product_name, SYSDATE
+                );
+                
+                -- إرسال إشعار للعميل
+                PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+                    p_customer_id => v_customer_id,
+                    p_title => 'تم تفعيل عقد التمويل',
+                    p_message => 'تم تفعيل عقد التمويل الخاص بك رقم ' || p_financing_id || ' بمبلغ ' || v_financing_amount || ' للمنتج ' || v_product_name,
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id
+                );
+                
+            WHEN 'COMPLETED' THEN
+                -- تحديث التزامات العميل المالية
+                UPDATE CUSTOMER_FINANCIAL_OBLIGATIONS
+                SET
+                    END_DATE = SYSDATE,
+                    LAST_UPDATE_DATE = SYSDATE
+                WHERE 
+                    CUSTOMER_ID = v_customer_id AND
+                    OBLIGATION_TYPE = 'FINANCING' AND
+                    DESCRIPTION LIKE '%تمويل رقم ' || p_financing_id || '%';
+                
+                -- إرسال إشعار للعميل
+                PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+                    p_customer_id => v_customer_id,
+                    p_title => 'تم إكمال عقد التمويل',
+                    p_message => 'تهانينا! تم إكمال عقد التمويل الخاص بك رقم ' || p_financing_id || ' للمنتج ' || v_product_name || ' بنجاح.',
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id
+                );
+                
+            WHEN 'CANCELLED' THEN
+                -- إرسال إشعار للعميل
+                PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+                    p_customer_id => v_customer_id,
+                    p_title => 'تم إلغاء عقد التمويل',
+                    p_message => 'تم إلغاء عقد التمويل الخاص بك رقم ' || p_financing_id || ' للمنتج ' || v_product_name || '. السبب: ' || p_reason,
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id
+                );
+                
+            WHEN 'DEFAULTED' THEN
+                -- تحديث التصنيف الائتماني للعميل
+                PKG_CREDIT_RATING.UPDATE_CUSTOMER_RATING(v_customer_id);
+                
+                -- إرسال إشعار للعميل
+                PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+                    p_customer_id => v_customer_id,
+                    p_title => 'تعثر في عقد التمويل',
+                    p_message => 'نود إبلاغك بأن عقد التمويل الخاص بك رقم ' || p_financing_id || ' للمنتج ' || v_product_name || ' قد تم تصنيفه كمتعثر. يرجى التواصل معنا في أقرب وقت ممكن.',
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id
+                );
+                
+                -- إرسال إشعار للإدارة
+                PKG_NOTIFICATIONS.SEND_SYSTEM_NOTIFICATION(
+                    p_title => 'تعثر في عقد التمويل',
+                    p_message => 'تم تصنيف عقد التمويل رقم ' || p_financing_id || ' للعميل رقم ' || v_customer_id || ' كمتعثر. السبب: ' || p_reason,
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id,
+                    p_user_id => NULL -- إرسال لجميع المستخدمين المصرح لهم
+                );
+                
+            WHEN 'SETTLED' THEN
+                -- تحديث التزامات العميل المالية
+                UPDATE CUSTOMER_FINANCIAL_OBLIGATIONS
+                SET
+                    END_DATE = SYSDATE,
+                    LAST_UPDATE_DATE = SYSDATE
+                WHERE 
+                    CUSTOMER_ID = v_customer_id AND
+                    OBLIGATION_TYPE = 'FINANCING' AND
+                    DESCRIPTION LIKE '%تمويل رقم ' || p_financing_id || '%';
+                
+                -- إرسال إشعار للعميل
+                PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+                    p_customer_id => v_customer_id,
+                    p_title => 'تمت تسوية عقد التمويل',
+                    p_message => 'تهانينا! تمت تسوية عقد التمويل الخاص بك رقم ' || p_financing_id || ' للمنتج ' || v_product_name || ' بنجاح.',
+                    p_notification_type => 'FINANCING',
+                    p_related_id => p_financing_id
+                );
+        END CASE;
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END CHANGE_CONTRACT_STATUS;
+    
+    -- تسجيل دفعة جديدة
+    PROCEDURE REGISTER_PAYMENT(
+        p_financing_id IN NUMBER,
+        p_installment_id IN NUMBER,
+        p_amount IN NUMBER,
+        p_payment_method IN VARCHAR2,
+        p_payment_date IN DATE,
+        p_reference_number IN VARCHAR2 DEFAULT NULL,
+        p_notes IN VARCHAR2 DEFAULT NULL,
+        p_created_by IN NUMBER,
+        p_payment_id OUT NUMBER
+    ) IS
+        v_contract_status VARCHAR2(50);
+        v_installment_status VARCHAR2(50);
+        v_installment_amount NUMBER;
+        v_installment_remaining NUMBER;
+        v_due_date DATE;
+        v_installment_number NUMBER;
+        v_customer_id NUMBER;
+        v_product_name VARCHAR2(100);
+        v_late_fees NUMBER := 0;
+        v_days_late NUMBER := 0;
+    BEGIN
+        -- التحقق من حالة عقد التمويل
+        SELECT CONTRACT_STATUS, CUSTOMER_ID
+        INTO v_contract_status, v_customer_id
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_status NOT IN ('ACTIVE', 'DEFAULTED') THEN
+            RAISE_APPLICATION_ERROR(-20023, 'لا يمكن تسجيل دفعة لعقد تمويل في الحالة: ' || v_contract_status);
+        END IF;
+        
+        -- الحصول على معلومات القسط
+        SELECT 
+            ins.INSTALLMENT_STATUS, ins.INSTALLMENT_AMOUNT, ins.REMAINING_AMOUNT, 
+            ins.DUE_DATE, ins.INSTALLMENT_NUMBER, ip.PRODUCT_NAME
+        INTO 
+            v_installment_status, v_installment_amount, v_installment_remaining, 
+            v_due_date, v_installment_number, v_product_name
+        FROM 
+            INSTALLMENT_SCHEDULE ins
+            JOIN FINANCING_CONTRACTS fc ON ins.FINANCING_ID = fc.FINANCING_ID
+            JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+        WHERE 
+            ins.INSTALLMENT_ID = p_installment_id AND ins.FINANCING_ID = p_financing_id;
+        
+        -- التحقق من حالة القسط
+        IF v_installment_status = 'PAID' THEN
+            RAISE_APPLICATION_ERROR(-20024, 'القسط رقم ' || v_installment_number || ' تم دفعه بالفعل');
+        END IF;
+        
+        -- حساب الغرامات إذا كان الدفع متأخراً
+        IF p_payment_date > v_due_date THEN
+            v_days_late := TRUNC(p_payment_date) - TRUNC(v_due_date);
+            
+            -- حساب غرامة التأخير (على سبيل المثال: 0.5% من مبلغ القسط لكل يوم تأخير، بحد أقصى 10%)
+            v_late_fees := LEAST(v_installment_amount * 0.005 * v_days_late, v_installment_amount * 0.1);
+            
+            -- تحديث غرامة التأخير في جدول الأقساط
+            UPDATE INSTALLMENT_SCHEDULE
+            SET LATE_FEES = v_late_fees
+            WHERE INSTALLMENT_ID = p_installment_id;
+        END IF;
+        
+        -- إنشاء معرف جديد للدفعة
+        SELECT SEQ_PAYMENT_ID.NEXTVAL INTO p_payment_id FROM DUAL;
+        
+        -- تسجيل الدفعة
+        INSERT INTO PAYMENTS (
+            PAYMENT_ID, FINANCING_ID, INSTALLMENT_ID, PAYMENT_AMOUNT,
+            PAYMENT_METHOD, PAYMENT_DATE, REFERENCE_NUMBER, NOTES,
+            CREATED_BY, CREATION_DATE, PAYMENT_STATUS
+        ) VALUES (
+            p_payment_id, p_financing_id, p_installment_id, p_amount,
+            p_payment_method, p_payment_date, p_reference_number, p_notes,
+            p_created_by, SYSDATE, 'COMPLETED'
+        );
+        
+        -- تحديث حالة القسط
+        IF p_amount >= (v_installment_remaining + v_late_fees) THEN
+            -- دفع كامل للقسط
+            UPDATE INSTALLMENT_SCHEDULE
+            SET
+                INSTALLMENT_STATUS = 'PAID',
+                PAID_DATE = p_payment_date,
+                PAID_AMOUNT = p_amount,
+                REMAINING_AMOUNT = 0,
+                LAST_UPDATE_DATE = SYSDATE
+            WHERE
+                INSTALLMENT_ID = p_installment_id;
+        ELSE
+            -- دفع جزئي للقسط
+            UPDATE INSTALLMENT_SCHEDULE
+            SET
+                PAID_AMOUNT = NVL(PAID_AMOUNT, 0) + p_amount,
+                REMAINING_AMOUNT = REMAINING_AMOUNT - p_amount,
+                LAST_UPDATE_DATE = SYSDATE
+            WHERE
+                INSTALLMENT_ID = p_installment_id;
+        END IF;
+        
+        -- تحديث المبلغ المتبقي في عقد التمويل
+        UPDATE_REMAINING_AMOUNT(p_financing_id);
+        
+        -- التحقق مما إذا كانت جميع الأقساط مدفوعة
+        DECLARE
+            v_unpaid_count NUMBER;
+        BEGIN
+            SELECT COUNT(*)
+            INTO v_unpaid_count
+            FROM INSTALLMENT_SCHEDULE
+            WHERE FINANCING_ID = p_financing_id AND INSTALLMENT_STATUS != 'PAID';
+            
+            IF v_unpaid_count = 0 THEN
+                -- تغيير حالة العقد إلى مكتمل
+                CHANGE_CONTRACT_STATUS(
+                    p_financing_id => p_financing_id,
+                    p_new_status => 'COMPLETED',
+                    p_reason => 'تم دفع جميع الأقساط',
+                    p_updated_by => p_created_by
+                );
+            END IF;
+        END;
+        
+        -- إرسال إشعار للعميل
+        PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+            p_customer_id => v_customer_id,
+            p_title => 'تم تسجيل دفعة جديدة',
+            p_message => 'تم تسجيل دفعة بمبلغ ' || p_amount || ' للقسط رقم ' || v_installment_number || ' من عقد التمويل رقم ' || p_financing_id || ' للمنتج ' || v_product_name,
+            p_notification_type => 'PAYMENT',
+            p_related_id => p_payment_id
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20025, 'عقد التمويل أو القسط غير موجود');
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END REGISTER_PAYMENT;
+    
+    -- إلغاء دفعة
+    PROCEDURE CANCEL_PAYMENT(
+        p_payment_id IN NUMBER,
+        p_reason IN VARCHAR2,
+        p_cancelled_by IN NUMBER
+    ) IS
+        v_payment_status VARCHAR2(50);
+        v_financing_id NUMBER;
+        v_installment_id NUMBER;
+        v_payment_amount NUMBER;
+        v_installment_status VARCHAR2(50);
+        v_paid_amount NUMBER;
+        v_installment_amount NUMBER;
+        v_customer_id NUMBER;
+    BEGIN
+        -- الحصول على معلومات الدفعة
+        SELECT 
+            p.PAYMENT_STATUS, p.FINANCING_ID, p.INSTALLMENT_ID, p.PAYMENT_AMOUNT,
+            ins.INSTALLMENT_STATUS, ins.PAID_AMOUNT, ins.INSTALLMENT_AMOUNT,
+            fc.CUSTOMER_ID
+        INTO 
+            v_payment_status, v_financing_id, v_installment_id, v_payment_amount,
+            v_installment_status, v_paid_amount, v_installment_amount,
+            v_customer_id
+        FROM 
+            PAYMENTS p
+            JOIN INSTALLMENT_SCHEDULE ins ON p.INSTALLMENT_ID = ins.INSTALLMENT_ID
+            JOIN FINANCING_CONTRACTS fc ON p.FINANCING_ID = fc.FINANCING_ID
+        WHERE 
+            p.PAYMENT_ID = p_payment_id;
+        
+        -- التحقق من إمكانية إلغاء الدفعة
+        IF v_payment_status = 'CANCELLED' THEN
+            RAISE_APPLICATION_ERROR(-20026, 'الدفعة تم إلغاؤها بالفعل');
+        END IF;
+        
+        -- تحديث حالة الدفعة
+        UPDATE PAYMENTS
+        SET
+            PAYMENT_STATUS = 'CANCELLED',
+            CANCELLATION_REASON = p_reason,
+            CANCELLED_BY = p_cancelled_by,
+            CANCELLATION_DATE = SYSDATE,
+            LAST_UPDATE_DATE = SYSDATE
+        WHERE
+            PAYMENT_ID = p_payment_id;
+        
+        -- تحديث حالة القسط
+        IF v_installment_status = 'PAID' AND v_paid_amount = v_payment_amount THEN
+            -- إذا كان القسط مدفوعاً بالكامل بواسطة هذه الدفعة، أعد تعيين حالته إلى غير مدفوع
+            UPDATE INSTALLMENT_SCHEDULE
+            SET
+                INSTALLMENT_STATUS = 'UNPAID',
+                PAID_DATE = NULL,
+                PAID_AMOUNT = 0,
+                REMAINING_AMOUNT = INSTALLMENT_AMOUNT,
+                LAST_UPDATE_DATE = SYSDATE
+            WHERE
+                INSTALLMENT_ID = v_installment_id;
+        ELSIF v_paid_amount > v_payment_amount THEN
+            -- إذا كان هناك دفعات أخرى للقسط، قم بتحديث المبلغ المدفوع والمتبقي
+            UPDATE INSTALLMENT_SCHEDULE
+            SET
+                PAID_AMOUNT = PAID_AMOUNT - v_payment_amount,
+                REMAINING_AMOUNT = REMAINING_AMOUNT + v_payment_amount,
+                LAST_UPDATE_DATE = SYSDATE
+            WHERE
+                INSTALLMENT_ID = v_installment_id;
+        END IF;
+        
+        -- تحديث المبلغ المتبقي في عقد التمويل
+        UPDATE_REMAINING_AMOUNT(v_financing_id);
+        
+        -- إرسال إشعار للعميل
+        PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+            p_customer_id => v_customer_id,
+            p_title => 'تم إلغاء دفعة',
+            p_message => 'تم إلغاء دفعة بمبلغ ' || v_payment_amount || ' لعقد التمويل رقم ' || v_financing_id || '. السبب: ' || p_reason,
+            p_notification_type => 'PAYMENT',
+            p_related_id => p_payment_id
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20027, 'الدفعة غير موجودة برقم: ' || p_payment_id);
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END CANCEL_PAYMENT;
+    
+    -- إعادة جدولة التمويل
+    PROCEDURE RESCHEDULE_FINANCING(
+        p_financing_id IN NUMBER,
+        p_new_installment_count IN NUMBER,
+        p_new_profit_rate IN NUMBER DEFAULT NULL,
+        p_grace_period_months IN NUMBER DEFAULT 0,
+        p_reason IN VARCHAR2,
+        p_approved_by IN NUMBER,
+        p_new_financing_id OUT NUMBER
+    ) IS
+        v_contract_status VARCHAR2(50);
+        v_customer_id NUMBER;
+        v_product_id NUMBER;
+        v_financing_amount NUMBER;
+        v_old_profit_rate NUMBER;
+        v_remaining_amount NUMBER;
+        v_paid_amount NUMBER;
+        v_profit_rate NUMBER;
+        v_profit_amount NUMBER;
+        v_total_amount NUMBER;
+        v_installment_amount NUMBER;
+        v_start_date DATE;
+        v_end_date DATE;
+    BEGIN
+        -- الحصول على معلومات عقد التمويل الحالي
+        SELECT 
+            CONTRACT_STATUS, CUSTOMER_ID, PRODUCT_ID, FINANCING_AMOUNT,
+            PROFIT_RATE, REMAINING_AMOUNT, (TOTAL_AMOUNT - REMAINING_AMOUNT) AS PAID_AMOUNT
+        INTO 
+            v_contract_status, v_customer_id, v_product_id, v_financing_amount,
+            v_old_profit_rate, v_remaining_amount, v_paid_amount
+        FROM 
+            FINANCING_CONTRACTS
+        WHERE 
+            FINANCING_ID = p_financing_id;
+        
+        -- التحقق من إمكانية إعادة جدولة العقد
+        IF v_contract_status NOT IN ('ACTIVE', 'DEFAULTED') THEN
+            RAISE_APPLICATION_ERROR(-20028, 'لا يمكن إعادة جدولة عقد تمويل في الحالة: ' || v_contract_status);
+        END IF;
+        
+        -- استخدام معدل الربح الجديد إذا تم تحديده، وإلا استخدم المعدل الحالي
+        v_profit_rate := COALESCE(p_new_profit_rate, v_old_profit_rate);
+        
+        -- تعيين تاريخ البدء الجديد (تاريخ اليوم + فترة السماح)
+        v_start_date := ADD_MONTHS(TRUNC(SYSDATE), p_grace_period_months);
+        
+        -- حساب تاريخ الانتهاء الجديد
+        v_end_date := ADD_MONTHS(v_start_date, p_new_installment_count);
+        
+        -- حساب مبلغ الربح الجديد والمبلغ الإجمالي
+        v_profit_amount := ROUND(v_remaining_amount * (v_profit_rate / 100) * (p_new_installment_count / 12), 2);
+        v_total_amount := v_remaining_amount + v_profit_amount;
+        
+        -- حساب مبلغ القسط الشهري الجديد
+        v_installment_amount := ROUND(v_total_amount / p_new_installment_count, 2);
+        
+        -- إنشاء معرف جديد لعقد التمويل المعاد جدولته
+        SELECT SEQ_FINANCING_ID.NEXTVAL INTO p_new_financing_id FROM DUAL;
+        
+        -- إنشاء عقد تمويل جديد للجدولة الجديدة
+        INSERT INTO FINANCING_CONTRACTS (
+            FINANCING_ID, CUSTOMER_ID, PRODUCT_ID, FINANCING_AMOUNT,
+            PROFIT_RATE, PROFIT_AMOUNT, TOTAL_AMOUNT, REMAINING_AMOUNT,
+            INSTALLMENT_COUNT, INSTALLMENT_AMOUNT, START_DATE, END_DATE,
+            CONTRACT_STATUS, NOTES, CREATED_BY, CREATION_DATE,
+            PARENT_FINANCING_ID
+        ) VALUES (
+            p_new_financing_id, v_customer_id, v_product_id, v_remaining_amount,
+            v_profit_rate, v_profit_amount, v_total_amount, v_total_amount,
+            p_new_installment_count, v_installment_amount, v_start_date, v_end_date,
+            'APPROVED', 'إعادة جدولة للعقد رقم ' || p_financing_id || '. السبب: ' || p_reason,
+            p_approved_by, SYSDATE, p_financing_id
+        );
+        
+        -- إنشاء جدول الأقساط للعقد الجديد
+        GENERATE_INSTALLMENT_SCHEDULE(p_new_financing_id);
+        
+        -- تغيير حالة العقد القديم إلى "معاد جدولته"
+        UPDATE FINANCING_CONTRACTS
+        SET
+            CONTRACT_STATUS = 'RESCHEDULED',
+            NOTES = NVL(NOTES, '') || CHR(10) || 'تمت إعادة جدولة هذا العقد إلى العقد رقم ' || p_new_financing_id || ' بتاريخ ' || TO_CHAR(SYSDATE, 'YYYY-MM-DD'),
+            LAST_UPDATE_DATE = SYSDATE,
+            LAST_UPDATED_BY = p_approved_by
+        WHERE
+            FINANCING_ID = p_financing_id;
+        
+        -- إضافة سجل لتغيير الحالة للعقد القديم
+        INSERT INTO FINANCING_STATUS_HISTORY (
+            HISTORY_ID, FINANCING_ID, OLD_STATUS, NEW_STATUS,
+            CHANGE_REASON, CHANGE_DATE, CHANGED_BY
+        ) VALUES (
+            SEQ_STATUS_HISTORY_ID.NEXTVAL, p_financing_id, v_contract_status, 'RESCHEDULED',
+            'تمت إعادة جدولة العقد إلى العقد رقم ' || p_new_financing_id || '. السبب: ' || p_reason,
+            SYSDATE, p_approved_by
+        );
+        
+        -- إضافة سجل لتغيير الحالة للعقد الجديد
+        INSERT INTO FINANCING_STATUS_HISTORY (
+            HISTORY_ID, FINANCING_ID, OLD_STATUS, NEW_STATUS,
+            CHANGE_REASON, CHANGE_DATE, CHANGED_BY
+        ) VALUES (
+            SEQ_STATUS_HISTORY_ID.NEXTVAL, p_new_financing_id, NULL, 'APPROVED',
+            'إنشاء عقد جديد من إعادة جدولة العقد رقم ' || p_financing_id || '. السبب: ' || p_reason,
+            SYSDATE, p_approved_by
+        );
+        
+        -- نقل الضمانات من العقد القديم إلى العقد الجديد
+        INSERT INTO FINANCING_COLLATERALS (
+            FINANCING_ID, COLLATERAL_ID, ADDED_DATE, ADDED_BY
+        )
+        SELECT 
+            p_new_financing_id, COLLATERAL_ID, SYSDATE, p_approved_by
+        FROM 
+            FINANCING_COLLATERALS
+        WHERE 
+            FINANCING_ID = p_financing_id;
+        
+        -- تحديث التزامات العميل المالية
+        UPDATE CUSTOMER_FINANCIAL_OBLIGATIONS
+        SET
+            END_DATE = SYSDATE,
+            LAST_UPDATE_DATE = SYSDATE
+        WHERE 
+            CUSTOMER_ID = v_customer_id AND
+            OBLIGATION_TYPE = 'FINANCING' AND
+            DESCRIPTION LIKE '%تمويل رقم ' || p_financing_id || '%';
+        
+        -- إضافة التزام مالي جديد للعقد المعاد جدولته
+        INSERT INTO CUSTOMER_FINANCIAL_OBLIGATIONS (
+            OBLIGATION_ID, CUSTOMER_ID, OBLIGATION_TYPE, OBLIGATION_AMOUNT,
+            MONTHLY_PAYMENT, START_DATE, END_DATE, DESCRIPTION, CREATION_DATE
+        ) VALUES (
+            SEQ_OBLIGATION_ID.NEXTVAL, v_customer_id, 'FINANCING', v_remaining_amount,
+            v_installment_amount, v_start_date, v_end_date,
+            'تمويل رقم ' || p_new_financing_id || ' (إعادة جدولة للعقد رقم ' || p_financing_id || ')', SYSDATE
+        );
+        
+        -- إرسال إشعار للعميل
+        PKG_NOTIFICATIONS.SEND_CUSTOMER_NOTIFICATION(
+            p_customer_id => v_customer_id,
+            p_title => 'تمت إعادة جدولة عقد التمويل',
+            p_message => 'تمت إعادة جدولة عقد التمويل الخاص بك رقم ' || p_financing_id || ' إلى عقد جديد برقم ' || p_new_financing_id || 
+                         ' بمبلغ متبقي ' || v_remaining_amount || ' وعدد أقساط ' || p_new_installment_count || ' قسط.',
+            p_notification_type => 'FINANCING',
+            p_related_id => p_new_financing_id
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END RESCHEDULE_FINANCING;
+    
+    -- البحث عن عقود التمويل
+    FUNCTION SEARCH_FINANCING_CONTRACTS(
+        p_customer_id IN NUMBER DEFAULT NULL,
+        p_product_id IN NUMBER DEFAULT NULL,
+        p_status IN VARCHAR2 DEFAULT NULL,
+        p_min_amount IN NUMBER DEFAULT NULL,
+        p_max_amount IN NUMBER DEFAULT NULL,
+        p_start_date_from IN DATE DEFAULT NULL,
+        p_start_date_to IN DATE DEFAULT NULL,
+        p_created_by IN NUMBER DEFAULT NULL
+    ) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+    BEGIN
+        OPEN v_cursor FOR
+            SELECT 
+                fc.FINANCING_ID,
+                fc.CUSTOMER_ID,
+                c.FULL_NAME AS CUSTOMER_NAME,
+                c.NATIONAL_ID AS CUSTOMER_NATIONAL_ID,
+                fc.PRODUCT_ID,
+                ip.PRODUCT_NAME,
+                ip.PRODUCT_TYPE,
+                fc.FINANCING_AMOUNT,
+                fc.PROFIT_RATE,
+                fc.PROFIT_AMOUNT,
+                fc.TOTAL_AMOUNT,
+                fc.REMAINING_AMOUNT,
+                fc.INSTALLMENT_COUNT,
+                fc.INSTALLMENT_AMOUNT,
+                fc.START_DATE,
+                fc.END_DATE,
+                fc.CONTRACT_STATUS,
+                fc.CREATION_DATE,
+                u.USERNAME AS CREATED_BY_NAME,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID) AS TOTAL_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'PAID') AS PAID_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'OVERDUE') AS OVERDUE_INSTALLMENTS,
+                (SELECT MIN(ins.DUE_DATE) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'UNPAID') AS NEXT_INSTALLMENT_DATE
+            FROM 
+                FINANCING_CONTRACTS fc
+                JOIN CUSTOMERS c ON fc.CUSTOMER_ID = c.CUSTOMER_ID
+                JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+                JOIN USERS u ON fc.CREATED_BY = u.USER_ID
+            WHERE 
+                (p_customer_id IS NULL OR fc.CUSTOMER_ID = p_customer_id) AND
+                (p_product_id IS NULL OR fc.PRODUCT_ID = p_product_id) AND
+                (p_status IS NULL OR fc.CONTRACT_STATUS = p_status) AND
+                (p_min_amount IS NULL OR fc.FINANCING_AMOUNT >= p_min_amount) AND
+                (p_max_amount IS NULL OR fc.FINANCING_AMOUNT <= p_max_amount) AND
+                (p_start_date_from IS NULL OR fc.START_DATE >= p_start_date_from) AND
+                (p_start_date_to IS NULL OR fc.START_DATE <= p_start_date_to) AND
+                (p_created_by IS NULL OR fc.CREATED_BY = p_created_by)
+            ORDER BY 
+                fc.CREATION_DATE DESC;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END SEARCH_FINANCING_CONTRACTS;
+    
+    -- الحصول على إحصائيات التمويل
+    FUNCTION GET_FINANCING_STATISTICS(
+        p_start_date IN DATE DEFAULT NULL,
+        p_end_date IN DATE DEFAULT NULL
+    ) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_start_date DATE := COALESCE(p_start_date, TRUNC(ADD_MONTHS(SYSDATE, -12)));
+        v_end_date DATE := COALESCE(p_end_date, TRUNC(SYSDATE));
+    BEGIN
+        OPEN v_cursor FOR
+            WITH status_counts AS (
+                SELECT 
+                    CONTRACT_STATUS,
+                    COUNT(*) AS COUNT,
+                    SUM(FINANCING_AMOUNT) AS TOTAL_AMOUNT,
+                    SUM(REMAINING_AMOUNT) AS REMAINING_AMOUNT
+                FROM 
+                    FINANCING_CONTRACTS
+                WHERE 
+                    CREATION_DATE BETWEEN v_start_date AND v_end_date
+                GROUP BY 
+                    CONTRACT_STATUS
+            ),
+            product_counts AS (
+                SELECT 
+                    ip.PRODUCT_NAME,
+                    ip.PRODUCT_TYPE,
+                    COUNT(*) AS COUNT,
+                    SUM(fc.FINANCING_AMOUNT) AS TOTAL_AMOUNT
+                FROM 
+                    FINANCING_CONTRACTS fc
+                    JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+                WHERE 
+                    fc.CREATION_DATE BETWEEN v_start_date AND v_end_date
+                GROUP BY 
+                    ip.PRODUCT_NAME, ip.PRODUCT_TYPE
+            ),
+            monthly_stats AS (
+                SELECT 
+                    TO_CHAR(CREATION_DATE, 'YYYY-MM') AS MONTH,
+                    COUNT(*) AS COUNT,
+                    SUM(FINANCING_AMOUNT) AS TOTAL_AMOUNT
+                FROM 
+                    FINANCING_CONTRACTS
+                WHERE 
+                    CREATION_DATE BETWEEN v_start_date AND v_end_date
+                GROUP BY 
+                    TO_CHAR(CREATION_DATE, 'YYYY-MM')
+                ORDER BY 
+                    TO_CHAR(CREATION_DATE, 'YYYY-MM')
+            ),
+            payment_stats AS (
+                SELECT 
+                    TO_CHAR(PAYMENT_DATE, 'YYYY-MM') AS MONTH,
+                    COUNT(*) AS COUNT,
+                    SUM(PAYMENT_AMOUNT) AS TOTAL_AMOUNT
+                FROM 
+                    PAYMENTS
+                WHERE 
+                    PAYMENT_DATE BETWEEN v_start_date AND v_end_date AND
+                    PAYMENT_STATUS = 'COMPLETED'
+                GROUP BY 
+                    TO_CHAR(PAYMENT_DATE, 'YYYY-MM')
+                ORDER BY 
+                    TO_CHAR(PAYMENT_DATE, 'YYYY-MM')
+            ),
+            overdue_stats AS (
+                SELECT 
+                    COUNT(*) AS OVERDUE_COUNT,
+                    SUM(REMAINING_AMOUNT) AS OVERDUE_AMOUNT
+                FROM 
+                    INSTALLMENT_SCHEDULE
+                WHERE 
+                    INSTALLMENT_STATUS = 'OVERDUE' AND
+                    DUE_DATE BETWEEN v_start_date AND v_end_date
+            )
+            SELECT 
+                'STATUS_COUNTS' AS STAT_TYPE,
+                CONTRACT_STATUS AS CATEGORY,
+                COUNT AS COUNT,
+                TOTAL_AMOUNT AS AMOUNT,
+                REMAINING_AMOUNT AS ADDITIONAL_AMOUNT,
+                NULL AS MONTH
+            FROM 
+                status_counts
+            UNION ALL
+            SELECT 
+                'PRODUCT_COUNTS' AS STAT_TYPE,
+                PRODUCT_NAME || ' (' || PRODUCT_TYPE || ')' AS CATEGORY,
+                COUNT AS COUNT,
+                TOTAL_AMOUNT AS AMOUNT,
+                NULL AS ADDITIONAL_AMOUNT,
+                NULL AS MONTH
+            FROM 
+                product_counts
+            UNION ALL
+            SELECT 
+                'MONTHLY_FINANCING' AS STAT_TYPE,
+                NULL AS CATEGORY,
+                COUNT AS COUNT,
+                TOTAL_AMOUNT AS AMOUNT,
+                NULL AS ADDITIONAL_AMOUNT,
+                MONTH AS MONTH
+            FROM 
+                monthly_stats
+            UNION ALL
+            SELECT 
+                'MONTHLY_PAYMENTS' AS STAT_TYPE,
+                NULL AS CATEGORY,
+                COUNT AS COUNT,
+                TOTAL_AMOUNT AS AMOUNT,
+                NULL AS ADDITIONAL_AMOUNT,
+                MONTH AS MONTH
+            FROM 
+                payment_stats
+            UNION ALL
+            SELECT 
+                'OVERDUE_SUMMARY' AS STAT_TYPE,
+                'OVERDUE' AS CATEGORY,
+                OVERDUE_COUNT AS COUNT,
+                OVERDUE_AMOUNT AS AMOUNT,
+                NULL AS ADDITIONAL_AMOUNT,
+                NULL AS MONTH
+            FROM 
+                overdue_stats
+            ORDER BY 
+                STAT_TYPE, MONTH, CATEGORY;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_FINANCING_STATISTICS;
+    
+    -- تحديث جدول الأقساط
+    PROCEDURE UPDATE_INSTALLMENT_SCHEDULE(
+        p_financing_id IN NUMBER,
+        p_regenerate_schedule IN BOOLEAN DEFAULT FALSE
+    ) IS
+    BEGIN
+        IF p_regenerate_schedule THEN
+            -- حذف جدول الأقساط الحالي وإعادة إنشائه
+            DELETE FROM INSTALLMENT_SCHEDULE
+            WHERE FINANCING_ID = p_financing_id AND INSTALLMENT_STATUS = 'UNPAID';
+            
+            -- إعادة إنشاء جدول الأقساط
+            GENERATE_INSTALLMENT_SCHEDULE(p_financing_id, TRUE);
+        ELSE
+            -- تحديث حالة الأقساط المتأخرة
+            UPDATE INSTALLMENT_SCHEDULE
+            SET
+                INSTALLMENT_STATUS = 'OVERDUE',
+                LAST_UPDATE_DATE = SYSDATE
+            WHERE
+                FINANCING_ID = p_financing_id AND
+                INSTALLMENT_STATUS = 'UNPAID' AND
+                DUE_DATE < TRUNC(SYSDATE);
+        END IF;
+        
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END UPDATE_INSTALLMENT_SCHEDULE;
+    
+    -- إنشاء جدول الأقساط
+    PROCEDURE GENERATE_INSTALLMENT_SCHEDULE(
+        p_financing_id IN NUMBER,
+        p_regenerate IN BOOLEAN DEFAULT FALSE
+    ) IS
+        v_financing_amount NUMBER;
+        v_profit_amount NUMBER;
+        v_total_amount NUMBER;
+        v_installment_count NUMBER;
+        v_installment_amount NUMBER;
+        v_start_date DATE;
+        v_end_date DATE;
+        v_due_date DATE;
+        v_principal_per_installment NUMBER;
+        v_profit_per_installment NUMBER;
+        v_existing_count NUMBER := 0;
+        v_start_number NUMBER := 1;
+    BEGIN
+        -- الحصول على معلومات عقد التمويل
+        SELECT 
+            FINANCING_AMOUNT, PROFIT_AMOUNT, TOTAL_AMOUNT,
+            INSTALLMENT_COUNT, INSTALLMENT_AMOUNT, START_DATE, END_DATE
+        INTO 
+            v_financing_amount, v_profit_amount, v_total_amount,
+            v_installment_count, v_installment_amount, v_start_date, v_end_date
+        FROM 
+            FINANCING_CONTRACTS
+        WHERE 
+            FINANCING_ID = p_financing_id;
+        
+        -- حساب مبلغ الأصل والربح لكل قسط
+        v_principal_per_installment := ROUND(v_financing_amount / v_installment_count, 2);
+        v_profit_per_installment := ROUND(v_profit_amount / v_installment_count, 2);
+        
+        -- التحقق من وجود أقساط حالية
+        IF NOT p_regenerate THEN
+            SELECT COUNT(*) INTO v_existing_count
+            FROM INSTALLMENT_SCHEDULE
+            WHERE FINANCING_ID = p_financing_id;
+            
+            IF v_existing_count > 0 THEN
+                RETURN; -- جدول الأقساط موجود بالفعل
+            END IF;
+        ELSE
+            -- إذا كنا نعيد إنشاء الجدول، نحصل على رقم القسط التالي
+            SELECT NVL(MAX(INSTALLMENT_NUMBER), 0) + 1 INTO v_start_number
+            FROM INSTALLMENT_SCHEDULE
+            WHERE FINANCING_ID = p_financing_id AND INSTALLMENT_STATUS = 'PAID';
+            
+            -- تحديث تاريخ البدء ليكون الشهر التالي من آخر قسط مدفوع
+            SELECT MAX(DUE_DATE) INTO v_due_date
+            FROM INSTALLMENT_SCHEDULE
+            WHERE FINANCING_ID = p_financing_id AND INSTALLMENT_STATUS = 'PAID';
+            
+            IF v_due_date IS NOT NULL THEN
+                v_start_date := ADD_MONTHS(v_due_date, 1);
+            END IF;
+        END IF;
+        
+        -- إنشاء جدول الأقساط
+        FOR i IN v_start_number .. v_installment_count LOOP
+            -- حساب تاريخ استحقاق القسط
+            v_due_date := ADD_MONTHS(v_start_date, i - v_start_number);
+            
+            -- إدراج القسط في الجدول
+            INSERT INTO INSTALLMENT_SCHEDULE (
+                INSTALLMENT_ID, FINANCING_ID, INSTALLMENT_NUMBER,
+                INSTALLMENT_AMOUNT, PRINCIPAL_AMOUNT, PROFIT_AMOUNT,
+                DUE_DATE, INSTALLMENT_STATUS, REMAINING_AMOUNT,
+                CREATION_DATE
+            ) VALUES (
+                SEQ_INSTALLMENT_ID.NEXTVAL, p_financing_id, i,
+                v_installment_amount, v_principal_per_installment, v_profit_per_installment,
+                v_due_date, 'UNPAID', v_installment_amount,
+                SYSDATE
+            );
+        END LOOP;
+        
+        -- تعديل القسط الأخير لمراعاة فروق التقريب
+        DECLARE
+            v_total_scheduled NUMBER;
+            v_difference NUMBER;
+            v_last_installment_id NUMBER;
+        BEGIN
+            -- حساب إجمالي المبلغ المجدول
+            SELECT SUM(INSTALLMENT_AMOUNT) INTO v_total_scheduled
+            FROM INSTALLMENT_SCHEDULE
+            WHERE FINANCING_ID = p_financing_id;
+            
+            -- حساب الفرق
+            v_difference := v_total_amount - v_total_scheduled;
+            
+            IF ABS(v_difference) > 0.01 THEN
+                -- الحصول على معرف آخر قسط
+                SELECT INSTALLMENT_ID INTO v_last_installment_id
+                FROM INSTALLMENT_SCHEDULE
+                WHERE FINANCING_ID = p_financing_id AND INSTALLMENT_NUMBER = v_installment_count;
+                
+                -- تعديل مبلغ آخر قسط
+                UPDATE INSTALLMENT_SCHEDULE
+                SET
+                    INSTALLMENT_AMOUNT = INSTALLMENT_AMOUNT + v_difference,
+                    PRINCIPAL_AMOUNT = PRINCIPAL_AMOUNT + v_difference,
+                    REMAINING_AMOUNT = INSTALLMENT_AMOUNT + v_difference
+                WHERE
+                    INSTALLMENT_ID = v_last_installment_id;
+            END IF;
+        END;
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END GENERATE_INSTALLMENT_SCHEDULE;
+    
+    -- تحديث المبلغ المتبقي في عقد التمويل
+    PROCEDURE UPDATE_REMAINING_AMOUNT(p_financing_id IN NUMBER) IS
+        v_remaining_amount NUMBER;
+    BEGIN
+        -- حساب المبلغ المتبقي من جدول الأقساط
+        SELECT NVL(SUM(REMAINING_AMOUNT), 0)
+        INTO v_remaining_amount
+        FROM INSTALLMENT_SCHEDULE
+        WHERE FINANCING_ID = p_financing_id;
+        
+        -- تحديث المبلغ المتبقي في عقد التمويل
+        UPDATE FINANCING_CONTRACTS
+        SET
+            REMAINING_AMOUNT = v_remaining_amount,
+            LAST_UPDATE_DATE = SYSDATE
+        WHERE
+            FINANCING_ID = p_financing_id;
+        
+        -- التحقق مما إذا كان المبلغ المتبقي صفراً وتغيير حالة العقد إلى مكتمل
+        IF v_remaining_amount = 0 THEN
+            UPDATE FINANCING_CONTRACTS
+            SET
+                CONTRACT_STATUS = 'COMPLETED',
+                LAST_UPDATE_DATE = SYSDATE
+            WHERE
+                FINANCING_ID = p_financing_id AND
+                CONTRACT_STATUS = 'ACTIVE';
+        END IF;
+        
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END UPDATE_REMAINING_AMOUNT;
+    
+    -- إضافة ضمان لعقد التمويل
+    PROCEDURE ADD_COLLATERAL(
+        p_financing_id IN NUMBER,
+        p_collateral_id IN NUMBER,
+        p_added_by IN NUMBER
+    ) IS
+        v_contract_status VARCHAR2(50);
+        v_collateral_exists NUMBER;
+    BEGIN
+        -- التحقق من حالة عقد التمويل
+        SELECT CONTRACT_STATUS
+        INTO v_contract_status
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_status NOT IN ('PENDING_APPROVAL', 'APPROVED', 'ACTIVE') THEN
+            RAISE_APPLICATION_ERROR(-20029, 'لا يمكن إضافة ضمان لعقد تمويل في الحالة: ' || v_contract_status);
+        END IF;
+        
+        -- التحقق من عدم وجود الضمان مسبقاً
+        SELECT COUNT(*)
+        INTO v_collateral_exists
+        FROM FINANCING_COLLATERALS
+        WHERE FINANCING_ID = p_financing_id AND COLLATERAL_ID = p_collateral_id;
+        
+        IF v_collateral_exists > 0 THEN
+            RAISE_APPLICATION_ERROR(-20030, 'الضمان موجود بالفعل في هذا العقد');
+        END IF;
+        
+        -- إضافة الضمان
+        INSERT INTO FINANCING_COLLATERALS (
+            FINANCING_ID, COLLATERAL_ID, ADDED_DATE, ADDED_BY
+        ) VALUES (
+            p_financing_id, p_collateral_id, SYSDATE, p_added_by
+        );
+        
+        -- إضافة ملاحظة حول إضافة الضمان
+        INSERT INTO FINANCING_NOTES (
+            NOTE_ID, FINANCING_ID, NOTE_TEXT, CREATED_BY, CREATION_DATE
+        ) VALUES (
+            SEQ_NOTE_ID.NEXTVAL, p_financing_id, 
+            'تمت إضافة ضمان جديد برقم ' || p_collateral_id,
+            p_added_by, SYSDATE
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END ADD_COLLATERAL;
+    
+    -- إزالة ضمان من عقد التمويل
+    PROCEDURE REMOVE_COLLATERAL(
+        p_financing_id IN NUMBER,
+        p_collateral_id IN NUMBER,
+        p_reason IN VARCHAR2,
+        p_removed_by IN NUMBER
+    ) IS
+        v_contract_status VARCHAR2(50);
+        v_collateral_exists NUMBER;
+    BEGIN
+        -- التحقق من حالة عقد التمويل
+        SELECT CONTRACT_STATUS
+        INTO v_contract_status
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_status NOT IN ('PENDING_APPROVAL', 'APPROVED', 'ACTIVE') THEN
+            RAISE_APPLICATION_ERROR(-20031, 'لا يمكن إزالة ضمان من عقد تمويل في الحالة: ' || v_contract_status);
+        END IF;
+        
+        -- التحقق من وجود الضمان
+        SELECT COUNT(*)
+        INTO v_collateral_exists
+        FROM FINANCING_COLLATERALS
+        WHERE FINANCING_ID = p_financing_id AND COLLATERAL_ID = p_collateral_id;
+        
+        IF v_collateral_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20032, 'الضمان غير موجود في هذا العقد');
+        END IF;
+        
+        -- إزالة الضمان
+        DELETE FROM FINANCING_COLLATERALS
+        WHERE FINANCING_ID = p_financing_id AND COLLATERAL_ID = p_collateral_id;
+        
+        -- إضافة ملاحظة حول إزالة الضمان
+        INSERT INTO FINANCING_NOTES (
+            NOTE_ID, FINANCING_ID, NOTE_TEXT, CREATED_BY, CREATION_DATE
+        ) VALUES (
+            SEQ_NOTE_ID.NEXTVAL, p_financing_id, 
+            'تمت إزالة الضمان رقم ' || p_collateral_id || '. السبب: ' || p_reason,
+            p_removed_by, SYSDATE
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END REMOVE_COLLATERAL;
+    
+    -- إضافة ملاحظة لعقد التمويل
+    PROCEDURE ADD_NOTE(
+        p_financing_id IN NUMBER,
+        p_note_text IN VARCHAR2,
+        p_created_by IN NUMBER
+    ) IS
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*)
+        INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        -- إضافة الملاحظة
+        INSERT INTO FINANCING_NOTES (
+            NOTE_ID, FINANCING_ID, NOTE_TEXT, CREATED_BY, CREATION_DATE
+        ) VALUES (
+            SEQ_NOTE_ID.NEXTVAL, p_financing_id, p_note_text, p_created_by, SYSDATE
+        );
+        
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END ADD_NOTE;
+    
+    -- الحصول على ملاحظات عقد التمويل
+    FUNCTION GET_FINANCING_NOTES(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*)
+        INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                fn.NOTE_ID,
+                fn.FINANCING_ID,
+                fn.NOTE_TEXT,
+                fn.CREATED_BY,
+                u.USERNAME AS CREATED_BY_NAME,
+                fn.CREATION_DATE
+            FROM 
+                FINANCING_NOTES fn
+                JOIN USERS u ON fn.CREATED_BY = u.USER_ID
+            WHERE 
+                fn.FINANCING_ID = p_financing_id
+            ORDER BY 
+                fn.CREATION_DATE DESC;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_FINANCING_NOTES;
+    
+    -- الحصول على تاريخ تغييرات حالة عقد التمويل
+    FUNCTION GET_STATUS_HISTORY(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*)
+        INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                fsh.HISTORY_ID,
+                fsh.FINANCING_ID,
+                fsh.OLD_STATUS,
+                fsh.NEW_STATUS,
+                fsh.CHANGE_REASON,
+                fsh.CHANGE_DATE,
+                fsh.CHANGED_BY,
+                u.USERNAME AS CHANGED_BY_NAME
+            FROM 
+                FINANCING_STATUS_HISTORY fsh
+                JOIN USERS u ON fsh.CHANGED_BY = u.USER_ID
+            WHERE 
+                fsh.FINANCING_ID = p_financing_id
+            ORDER BY 
+                fsh.CHANGE_DATE DESC;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_STATUS_HISTORY;
+    
+    -- الحصول على الضمانات المرتبطة بعقد التمويل
+    FUNCTION GET_FINANCING_COLLATERALS(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*)
+        INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                fc.FINANCING_ID,
+                fc.COLLATERAL_ID,
+                c.COLLATERAL_TYPE,
+                c.COLLATERAL_VALUE,
+                c.DESCRIPTION AS COLLATERAL_DESCRIPTION,
+                c.CUSTOMER_ID,
+                cu.FULL_NAME AS CUSTOMER_NAME,
+                fc.ADDED_DATE,
+                fc.ADDED_BY,
+                u.USERNAME AS ADDED_BY_NAME
+            FROM 
+                FINANCING_COLLATERALS fc
+                JOIN COLLATERALS c ON fc.COLLATERAL_ID = c.COLLATERAL_ID
+                JOIN CUSTOMERS cu ON c.CUSTOMER_ID = cu.CUSTOMER_ID
+                JOIN USERS u ON fc.ADDED_BY = u.USER_ID
+            WHERE 
+                fc.FINANCING_ID = p_financing_id
+            ORDER BY 
+                fc.ADDED_DATE DESC;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_FINANCING_COLLATERALS;
+    
+    -- الحصول على جدول الأقساط لعقد التمويل
+    FUNCTION GET_INSTALLMENT_SCHEDULE(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*)
+        INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                ins.INSTALLMENT_ID,
+                ins.FINANCING_ID,
+                ins.INSTALLMENT_NUMBER,
+                ins.INSTALLMENT_AMOUNT,
+                ins.PRINCIPAL_AMOUNT,
+                ins.PROFIT_AMOUNT,
+                ins.DUE_DATE,
+                ins.INSTALLMENT_STATUS,
+                ins.PAID_DATE,
+                ins.PAID_AMOUNT,
+                ins.REMAINING_AMOUNT,
+                ins.LATE_FEES,
+                (SELECT SUM(p.PAYMENT_AMOUNT) 
+                 FROM PAYMENTS p 
+                 WHERE p.INSTALLMENT_ID = ins.INSTALLMENT_ID AND p.PAYMENT_STATUS = 'COMPLETED') AS TOTAL_PAYMENTS,
+                (SELECT COUNT(*) 
+                 FROM PAYMENTS p 
+                 WHERE p.INSTALLMENT_ID = ins.INSTALLMENT_ID AND p.PAYMENT_STATUS = 'COMPLETED') AS PAYMENT_COUNT,
+                CASE 
+                    WHEN ins.INSTALLMENT_STATUS = 'UNPAID' AND ins.DUE_DATE < SYSDATE THEN
+                        TRUNC(SYSDATE) - TRUNC(ins.DUE_DATE)
+                    ELSE 0
+                END AS DAYS_OVERDUE
+            FROM 
+                INSTALLMENT_SCHEDULE ins
+            WHERE 
+                ins.FINANCING_ID = p_financing_id
+            ORDER BY 
+                ins.INSTALLMENT_NUMBER;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_INSTALLMENT_SCHEDULE;
+    
+    -- الحصول على دفعات عقد التمويل
+    FUNCTION GET_FINANCING_PAYMENTS(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_contract_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العقد
+        SELECT COUNT(*)
+        INTO v_contract_exists
+        FROM FINANCING_CONTRACTS
+        WHERE FINANCING_ID = p_financing_id;
+        
+        IF v_contract_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                p.PAYMENT_ID,
+                p.FINANCING_ID,
+                p.INSTALLMENT_ID,
+                ins.INSTALLMENT_NUMBER,
+                p.PAYMENT_AMOUNT,
+                p.PAYMENT_METHOD,
+                p.PAYMENT_DATE,
+                p.PAYMENT_STATUS,
+                p.REFERENCE_NUMBER,
+                p.NOTES,
+                p.CREATED_BY,
+                u1.USERNAME AS CREATED_BY_NAME,
+                p.CREATION_DATE,
+                p.CANCELLATION_REASON,
+                p.CANCELLED_BY,
+                u2.USERNAME AS CANCELLED_BY_NAME,
+                p.CANCELLATION_DATE
+            FROM 
+                PAYMENTS p
+                JOIN INSTALLMENT_SCHEDULE ins ON p.INSTALLMENT_ID = ins.INSTALLMENT_ID
+                JOIN USERS u1 ON p.CREATED_BY = u1.USER_ID
+                LEFT JOIN USERS u2 ON p.CANCELLED_BY = u2.USER_ID
+            WHERE 
+                p.FINANCING_ID = p_financing_id
+            ORDER BY 
+                p.PAYMENT_DATE DESC, p.CREATION_DATE DESC;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_FINANCING_PAYMENTS;
+    
+    -- تحديث الأقساط المتأخرة لجميع عقود التمويل
+    PROCEDURE UPDATE_OVERDUE_INSTALLMENTS IS
+        v_count NUMBER := 0;
+    BEGIN
+        -- تحديث حالة الأقساط المتأخرة
+        UPDATE INSTALLMENT_SCHEDULE
+        SET
+            INSTALLMENT_STATUS = 'OVERDUE',
+            LAST_UPDATE_DATE = SYSDATE
+        WHERE
+            INSTALLMENT_STATUS = 'UNPAID' AND
+            DUE_DATE < TRUNC(SYSDATE);
+        
+        v_count := SQL%ROWCOUNT;
+        
+        -- تسجيل عدد الأقساط التي تم تحديثها
+        INSERT INTO SYSTEM_LOGS (
+            LOG_ID, LOG_TYPE, LOG_MESSAGE, CREATION_DATE
+        ) VALUES (
+            SEQ_LOG_ID.NEXTVAL, 'FINANCING', 'تم تحديث ' || v_count || ' قسط متأخر', SYSDATE
+        );
+        
+        -- تحديث حالة العقود المتعثرة (إذا كان هناك أكثر من 3 أقساط متأخرة)
+        FOR rec IN (
+            SELECT 
+                fc.FINANCING_ID, 
+                fc.CUSTOMER_ID,
+                COUNT(*) AS OVERDUE_COUNT
+            FROM 
+                FINANCING_CONTRACTS fc
+                JOIN INSTALLMENT_SCHEDULE ins ON fc.FINANCING_ID = ins.FINANCING_ID
+            WHERE 
+                fc.CONTRACT_STATUS = 'ACTIVE' AND
+                ins.INSTALLMENT_STATUS = 'OVERDUE'
+            GROUP BY 
+                fc.FINANCING_ID, fc.CUSTOMER_ID
+            HAVING 
+                COUNT(*) >= 3
+        ) LOOP
+            -- تغيير حالة العقد إلى متعثر
+            CHANGE_CONTRACT_STATUS(
+                p_financing_id => rec.FINANCING_ID,
+                p_new_status => 'DEFAULTED',
+                p_reason => 'تجاوز عدد الأقساط المتأخرة الحد المسموح به (' || rec.OVERDUE_COUNT || ' أقساط)',
+                p_updated_by => 1  -- معرف المستخدم النظامي
+            );
+            
+            -- تحديث التصنيف الائتماني للعميل
+            PKG_CREDIT_RATING.UPDATE_CUSTOMER_RATING(rec.CUSTOMER_ID);
+        END LOOP;
+        
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            
+            -- تسجيل الخطأ
+            INSERT INTO SYSTEM_LOGS (
+                LOG_ID, LOG_TYPE, LOG_MESSAGE, CREATION_DATE
+            ) VALUES (
+                SEQ_LOG_ID.NEXTVAL, 'ERROR', 'خطأ في تحديث الأقساط المتأخرة: ' || SQLERRM, SYSDATE
+            );
+            
+            COMMIT;
+            RAISE;
+    END UPDATE_OVERDUE_INSTALLMENTS;
+    
+    -- الحصول على تفاصيل عقد التمويل
+    FUNCTION GET_FINANCING_DETAILS(p_financing_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+    BEGIN
+        OPEN v_cursor FOR
+            SELECT 
+                fc.FINANCING_ID,
+                fc.CUSTOMER_ID,
+                c.FULL_NAME AS CUSTOMER_NAME,
+                c.NATIONAL_ID AS CUSTOMER_NATIONAL_ID,
+                c.MOBILE_NUMBER AS CUSTOMER_MOBILE,
+                c.EMAIL AS CUSTOMER_EMAIL,
+                fc.PRODUCT_ID,
+                ip.PRODUCT_NAME,
+                ip.PRODUCT_TYPE,
+                fc.FINANCING_AMOUNT,
+                fc.PROFIT_RATE,
+                fc.PROFIT_AMOUNT,
+                fc.TOTAL_AMOUNT,
+                fc.REMAINING_AMOUNT,
+                fc.INSTALLMENT_COUNT,
+                fc.INSTALLMENT_AMOUNT,
+                fc.START_DATE,
+                fc.END_DATE,
+                fc.CONTRACT_STATUS,
+                fc.CONTRACT_NUMBER,
+                fc.NOTES,
+                fc.PARENT_FINANCING_ID,
+                (SELECT fc2.CONTRACT_NUMBER FROM FINANCING_CONTRACTS fc2 WHERE fc2.FINANCING_ID = fc.PARENT_FINANCING_ID) AS PARENT_CONTRACT_NUMBER,
+                fc.CREATED_BY,
+                u1.USERNAME AS CREATED_BY_NAME,
+                fc.CREATION_DATE,
+                fc.LAST_UPDATED_BY,
+                u2.USERNAME AS LAST_UPDATED_BY_NAME,
+                fc.LAST_UPDATE_DATE,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID) AS TOTAL_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'PAID') AS PAID_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'OVERDUE') AS OVERDUE_INSTALLMENTS,
+                (SELECT COUNT(*) FROM FINANCING_COLLATERALS fcol WHERE fcol.FINANCING_ID = fc.FINANCING_ID) AS COLLATERAL_COUNT,
+                (SELECT SUM(col.COLLATERAL_VALUE) FROM FINANCING_COLLATERALS fcol JOIN COLLATERALS col ON fcol.COLLATERAL_ID = col.COLLATERAL_ID WHERE fcol.FINANCING_ID = fc.FINANCING_ID) AS TOTAL_COLLATERAL_VALUE,
+                (SELECT MIN(ins.DUE_DATE) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'UNPAID') AS NEXT_INSTALLMENT_DATE,
+                (SELECT ins.INSTALLMENT_AMOUNT FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'UNPAID' AND ROWNUM = 1 ORDER BY ins.DUE_DATE) AS NEXT_INSTALLMENT_AMOUNT,                
+                (SELECT SUM(p.PAYMENT_AMOUNT) FROM PAYMENTS p WHERE p.FINANCING_ID = fc.FINANCING_ID AND p.PAYMENT_STATUS = 'COMPLETED') AS TOTAL_PAYMENTS,
+                (SELECT MAX(p.PAYMENT_DATE) FROM PAYMENTS p WHERE p.FINANCING_ID = fc.FINANCING_ID AND p.PAYMENT_STATUS = 'COMPLETED') AS LAST_PAYMENT_DATE,
+                (SELECT SUM(ins.LATE_FEES) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID) AS TOTAL_LATE_FEES
+            FROM 
+                FINANCING_CONTRACTS fc
+                JOIN CUSTOMERS c ON fc.CUSTOMER_ID = c.CUSTOMER_ID
+                JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+                JOIN USERS u1 ON fc.CREATED_BY = u1.USER_ID
+                LEFT JOIN USERS u2 ON fc.LAST_UPDATED_BY = u2.USER_ID
+            WHERE 
+                fc.FINANCING_ID = p_financing_id;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20014, 'عقد التمويل غير موجود برقم: ' || p_financing_id);
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_FINANCING_DETAILS;
+    
+    -- الحصول على عقود التمويل للعميل
+    FUNCTION GET_CUSTOMER_FINANCINGS(p_customer_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_customer_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العميل
+        SELECT COUNT(*)
+        INTO v_customer_exists
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        IF v_customer_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20033, 'العميل غير موجود برقم: ' || p_customer_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                fc.FINANCING_ID,
+                fc.CONTRACT_NUMBER,
+                fc.PRODUCT_ID,
+                ip.PRODUCT_NAME,
+                ip.PRODUCT_TYPE,
+                fc.FINANCING_AMOUNT,
+                fc.TOTAL_AMOUNT,
+                fc.REMAINING_AMOUNT,
+                fc.INSTALLMENT_COUNT,
+                fc.INSTALLMENT_AMOUNT,
+                fc.START_DATE,
+                fc.END_DATE,
+                fc.CONTRACT_STATUS,
+                fc.CREATION_DATE,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID) AS TOTAL_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'PAID') AS PAID_INSTALLMENTS,
+                (SELECT COUNT(*) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'OVERDUE') AS OVERDUE_INSTALLMENTS,
+                (SELECT MIN(ins.DUE_DATE) FROM INSTALLMENT_SCHEDULE ins WHERE ins.FINANCING_ID = fc.FINANCING_ID AND ins.INSTALLMENT_STATUS = 'UNPAID') AS NEXT_INSTALLMENT_DATE,
+                (SELECT MAX(p.PAYMENT_DATE) FROM PAYMENTS p WHERE p.FINANCING_ID = fc.FINANCING_ID AND p.PAYMENT_STATUS = 'COMPLETED') AS LAST_PAYMENT_DATE
+            FROM 
+                FINANCING_CONTRACTS fc
+                JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+            WHERE 
+                fc.CUSTOMER_ID = p_customer_id
+            ORDER BY 
+                fc.CREATION_DATE DESC;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_CUSTOMER_FINANCINGS;
+    
+    -- الحصول على الأقساط المستحقة للعميل
+    FUNCTION GET_CUSTOMER_DUE_INSTALLMENTS(p_customer_id IN NUMBER) RETURN SYS_REFCURSOR IS
+        v_cursor SYS_REFCURSOR;
+        v_customer_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العميل
+        SELECT COUNT(*)
+        INTO v_customer_exists
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        IF v_customer_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20033, 'العميل غير موجود برقم: ' || p_customer_id);
+        END IF;
+        
+        OPEN v_cursor FOR
+            SELECT 
+                ins.INSTALLMENT_ID,
+                ins.FINANCING_ID,
+                fc.CONTRACT_NUMBER,
+                ip.PRODUCT_NAME,
+                ins.INSTALLMENT_NUMBER,
+                ins.INSTALLMENT_AMOUNT,
+                ins.DUE_DATE,
+                ins.INSTALLMENT_STATUS,
+                ins.REMAINING_AMOUNT,
+                ins.LATE_FEES,
+                CASE 
+                    WHEN ins.INSTALLMENT_STATUS = 'UNPAID' AND ins.DUE_DATE < SYSDATE THEN
+                        TRUNC(SYSDATE) - TRUNC(ins.DUE_DATE)
+                    ELSE 0
+                END AS DAYS_OVERDUE
+            FROM 
+                INSTALLMENT_SCHEDULE ins
+                JOIN FINANCING_CONTRACTS fc ON ins.FINANCING_ID = fc.FINANCING_ID
+                JOIN ISLAMIC_PRODUCTS ip ON fc.PRODUCT_ID = ip.PRODUCT_ID
+            WHERE 
+                fc.CUSTOMER_ID = p_customer_id AND
+                ins.INSTALLMENT_STATUS IN ('UNPAID', 'OVERDUE') AND
+                fc.CONTRACT_STATUS IN ('ACTIVE', 'DEFAULTED')
+            ORDER BY 
+                ins.DUE_DATE;
+        
+        RETURN v_cursor;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END GET_CUSTOMER_DUE_INSTALLMENTS;
+    
+    -- حساب إجمالي المديونية للعميل
+    FUNCTION CALCULATE_CUSTOMER_DEBT(p_customer_id IN NUMBER) RETURN NUMBER IS
+        v_total_debt NUMBER := 0;
+        v_customer_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العميل
+        SELECT COUNT(*)
+        INTO v_customer_exists
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        IF v_customer_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20033, 'العميل غير موجود برقم: ' || p_customer_id);
+        END IF;
+        
+        -- حساب إجمالي المديونية من عقود التمويل النشطة
+        SELECT NVL(SUM(REMAINING_AMOUNT), 0)
+        INTO v_total_debt
+        FROM FINANCING_CONTRACTS
+        WHERE CUSTOMER_ID = p_customer_id AND CONTRACT_STATUS IN ('ACTIVE', 'DEFAULTED');
+        
+        RETURN v_total_debt;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END CALCULATE_CUSTOMER_DEBT;
+    
+    -- حساب نسبة الأقساط الشهرية إلى الدخل
+    FUNCTION CALCULATE_DTI_RATIO(p_customer_id IN NUMBER) RETURN NUMBER IS
+        v_monthly_income NUMBER;
+        v_monthly_obligations NUMBER := 0;
+        v_dti_ratio NUMBER := 0;
+        v_customer_exists NUMBER;
+    BEGIN
+        -- التحقق من وجود العميل
+        SELECT COUNT(*)
+        INTO v_customer_exists
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        IF v_customer_exists = 0 THEN
+            RAISE_APPLICATION_ERROR(-20033, 'العميل غير موجود برقم: ' || p_customer_id);
+        END IF;
+        
+        -- الحصول على الدخل الشهري للعميل
+        SELECT NVL(MONTHLY_INCOME, 0)
+        INTO v_monthly_income
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        -- حساب إجمالي الالتزامات الشهرية
+        SELECT NVL(SUM(MONTHLY_PAYMENT), 0)
+        INTO v_monthly_obligations
+        FROM CUSTOMER_FINANCIAL_OBLIGATIONS
+        WHERE CUSTOMER_ID = p_customer_id AND END_DATE > SYSDATE;
+        
+        -- حساب نسبة الأقساط إلى الدخل
+        IF v_monthly_income > 0 THEN
+            v_dti_ratio := (v_monthly_obligations / v_monthly_income) * 100;
+        ELSE
+            v_dti_ratio := 0;
+        END IF;
+        
+        RETURN v_dti_ratio;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END CALCULATE_DTI_RATIO;
+    
+    -- التحقق من أهلية العميل للتمويل
+    FUNCTION CHECK_FINANCING_ELIGIBILITY(
+        p_customer_id IN NUMBER,
+        p_financing_amount IN NUMBER,
+        p_installment_count IN NUMBER,
+        p_product_id IN NUMBER
+    ) RETURN VARCHAR2 IS
+        v_customer_exists NUMBER;
+        v_product_exists NUMBER;
+        v_monthly_income NUMBER;
+        v_credit_score NUMBER;
+        v_dti_ratio NUMBER;
+        v_max_dti_ratio NUMBER := 50; -- الحد الأقصى لنسبة الأقساط إلى الدخل
+        v_min_credit_score NUMBER := 600; -- الحد الأدنى للتصنيف الائتماني
+        v_monthly_installment NUMBER;
+        v_new_dti_ratio NUMBER;
+        v_result VARCHAR2(4000);
+        v_profit_rate NUMBER;
+        v_total_amount NUMBER;
+    BEGIN
+        -- التحقق من وجود العميل
+        SELECT COUNT(*)
+        INTO v_customer_exists
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        IF v_customer_exists = 0 THEN
+            RETURN 'غير مؤهل: العميل غير موجود';
+        END IF;
+        
+        -- التحقق من وجود المنتج
+        SELECT COUNT(*)
+        INTO v_product_exists
+        FROM ISLAMIC_PRODUCTS
+        WHERE PRODUCT_ID = p_product_id AND PRODUCT_STATUS = 'ACTIVE';
+        
+        IF v_product_exists = 0 THEN
+            RETURN 'غير مؤهل: المنتج غير موجود أو غير نشط';
+        END IF;
+        
+        -- الحصول على معلومات العميل
+        SELECT NVL(MONTHLY_INCOME, 0), NVL(CREDIT_SCORE, 0)
+        INTO v_monthly_income, v_credit_score
+        FROM CUSTOMERS
+        WHERE CUSTOMER_ID = p_customer_id;
+        
+        -- الحصول على معدل الربح للمنتج
+        SELECT PROFIT_RATE
+        INTO v_profit_rate
+        FROM ISLAMIC_PRODUCTS
+        WHERE PRODUCT_ID = p_product_id;
+        
+        -- حساب إجمالي المبلغ مع الربح
+        v_total_amount := p_financing_amount * (1 + (v_profit_rate / 100) * (p_installment_count / 12));
+        
+        -- حساب القسط الشهري
+        v_monthly_installment := v_total_amount / p_installment_count;
+        
+        -- حساب نسبة الأقساط الحالية إلى الدخل
+        v_dti_ratio := CALCULATE_DTI_RATIO(p_customer_id);
+        
+        -- حساب نسبة الأقساط الجديدة إلى الدخل
+        IF v_monthly_income > 0 THEN
+            v_new_dti_ratio := v_dti_ratio + ((v_monthly_installment / v_monthly_income) * 100);
+        ELSE
+            v_new_dti_ratio := 100; -- إذا كان الدخل صفر، فنسبة الأقساط إلى الدخل ستكون 100%
+        END IF;
+        
+        -- التحقق من الأهلية
+        v_result := 'مؤهل للتمويل';
+        
+        -- التحقق من التصنيف الائتماني
+        IF v_credit_score < v_min_credit_score THEN
+            v_result := 'غير مؤهل: التصنيف الائتماني منخفض (' || v_credit_score || '). الحد الأدنى المطلوب: ' || v_min_credit_score;
+            RETURN v_result;
+        END IF;
+        
+        -- التحقق من نسبة الأقساط إلى الدخل
+        IF v_new_dti_ratio > v_max_dti_ratio THEN
+            v_result := 'غير مؤهل: نسبة الأقساط إلى الدخل مرتفعة (' || ROUND(v_new_dti_ratio, 2) || '%). الحد الأقصى المسموح: ' || v_max_dti_ratio || '%';
+            RETURN v_result;
+        END IF;
+        
+        -- إضافة معلومات إضافية
+        v_result := v_result || CHR(10) || 
+                   'الدخل الشهري: ' || v_monthly_income || CHR(10) ||
+                   'التصنيف الائتماني: ' || v_credit_score || CHR(10) ||
+                   'نسبة الأقساط الحالية إلى الدخل: ' || ROUND(v_dti_ratio, 2) || '%' || CHR(10) ||
+                   'نسبة الأقساط المتوقعة إلى الدخل بعد التمويل الجديد: ' || ROUND(v_new_dti_ratio, 2) || '%' || CHR(10) ||
+                   'القسط الشهري المتوقع: ' || ROUND(v_monthly_installment, 2);
+        
+        RETURN v_result;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN 'خطأ في التحقق من الأهلية: ' || SQLERRM;
+    END CHECK_FINANCING_ELIGIBILITY;
+    
+    -- إنشاء رقم عقد فريد
+    FUNCTION GENERATE_CONTRACT_NUMBER(
+        p_product_id IN NUMBER,
+        p_customer_id IN NUMBER
+    ) RETURN VARCHAR2 IS
+        v_product_code VARCHAR2(10);
+        v_year VARCHAR2(2);
+        v_sequence NUMBER;
+        v_contract_number VARCHAR2(20);
+    BEGIN
+        -- الحصول على رمز المنتج
+        SELECT SUBSTR(PRODUCT_CODE, 1, 3)
+        INTO v_product_code
+        FROM ISLAMIC_PRODUCTS
+        WHERE PRODUCT_ID = p_product_id;
+        
+        -- الحصول على السنة الحالية (آخر رقمين)
+        v_year := TO_CHAR(SYSDATE, 'YY');
+        
+        -- الحصول على رقم تسلسلي جديد
+        SELECT NVL(MAX(TO_NUMBER(REGEXP_SUBSTR(CONTRACT_NUMBER, '[0-9]+$'))), 0) + 1
+        INTO v_sequence
+        FROM FINANCING_CONTRACTS
+        WHERE CONTRACT_NUMBER LIKE v_product_code || v_year || '%';
+        
+        -- إنشاء رقم العقد
+        v_contract_number := v_product_code || v_year || LPAD(v_sequence, 6, '0');
+        
+        RETURN v_contract_number;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20034, 'المنتج غير موجود برقم: ' || p_product_id);
+        WHEN OTHERS THEN
+            RAISE;
+    END GENERATE_CONTRACT_NUMBER;
+    
+END PKG_FINANCING;
+/
